@@ -4,129 +4,134 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
-const dotenv = require('dotenv');
 const path = require('path');
-
-// Load environment variables
-dotenv.config();
+const multer = require('multer');
+const config = require('./config/config');
+const SocketController = require('./controllers/socketController');
 
 // Initialize Express app
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: process.env.CLIENT_URL || 'http://localhost:5173',
-    methods: ['GET', 'POST'],
+    origin: config.clientUrl,
+    methods: ['GET', 'POST', 'PUT', 'DELETE'],
     credentials: true,
   },
 });
+
+// Initialize Socket Controller
+const socketController = new SocketController(io);
 
 // Middleware
 app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Store connected users and messages
-const users = {};
-const messages = [];
-const typingUsers = {};
+// File upload configuration
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, 'uploads/');
+  },
+  filename: (req, file, cb) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
+  }
+});
+
+const upload = multer({ 
+  storage: storage,
+  limits: {
+    fileSize: 5 * 1024 * 1024 // 5MB limit
+  },
+  fileFilter: (req, file, cb) => {
+    // Allow images and common file types
+    const allowedTypes = /jpeg|jpg|png|gif|pdf|doc|docx|txt/;
+    const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
+    const mimetype = allowedTypes.test(file.mimetype);
+    
+    if (mimetype && extname) {
+      return cb(null, true);
+    } else {
+      cb(new Error('Only image and document files are allowed'));
+    }
+  }
+});
+
+// Create uploads directory if it doesn't exist
+const fs = require('fs');
+if (!fs.existsSync('uploads')) {
+  fs.mkdirSync('uploads');
+}
 
 // Socket.io connection handler
 io.on('connection', (socket) => {
-  console.log(`User connected: ${socket.id}`);
-
-  // Handle user joining
-  socket.on('user_join', (username) => {
-    users[socket.id] = { username, id: socket.id };
-    io.emit('user_list', Object.values(users));
-    io.emit('user_joined', { username, id: socket.id });
-    console.log(`${username} joined the chat`);
-  });
-
-  // Handle chat messages
-  socket.on('send_message', (messageData) => {
-    const message = {
-      ...messageData,
-      id: Date.now(),
-      sender: users[socket.id]?.username || 'Anonymous',
-      senderId: socket.id,
-      timestamp: new Date().toISOString(),
-    };
-    
-    messages.push(message);
-    
-    // Limit stored messages to prevent memory issues
-    if (messages.length > 100) {
-      messages.shift();
-    }
-    
-    io.emit('receive_message', message);
-  });
-
-  // Handle typing indicator
-  socket.on('typing', (isTyping) => {
-    if (users[socket.id]) {
-      const username = users[socket.id].username;
-      
-      if (isTyping) {
-        typingUsers[socket.id] = username;
-      } else {
-        delete typingUsers[socket.id];
-      }
-      
-      io.emit('typing_users', Object.values(typingUsers));
-    }
-  });
-
-  // Handle private messages
-  socket.on('private_message', ({ to, message }) => {
-    const messageData = {
-      id: Date.now(),
-      sender: users[socket.id]?.username || 'Anonymous',
-      senderId: socket.id,
-      message,
-      timestamp: new Date().toISOString(),
-      isPrivate: true,
-    };
-    
-    socket.to(to).emit('private_message', messageData);
-    socket.emit('private_message', messageData);
-  });
-
-  // Handle disconnection
-  socket.on('disconnect', () => {
-    if (users[socket.id]) {
-      const { username } = users[socket.id];
-      io.emit('user_left', { username, id: socket.id });
-      console.log(`${username} left the chat`);
-    }
-    
-    delete users[socket.id];
-    delete typingUsers[socket.id];
-    
-    io.emit('user_list', Object.values(users));
-    io.emit('typing_users', Object.values(typingUsers));
-  });
+  socketController.handleConnection(socket);
 });
 
 // API routes
-app.get('/api/messages', (req, res) => {
+app.get('/api/rooms', (req, res) => {
+  res.json(socketController.getRoomsList());
+});
+
+app.get('/api/rooms/:roomId/messages', (req, res) => {
+  const { roomId } = req.params;
+  const messages = socketController.getRoomMessages(roomId);
   res.json(messages);
 });
 
 app.get('/api/users', (req, res) => {
-  res.json(Object.values(users));
+  const users = Array.from(socketController.users.values());
+  res.json(users);
 });
+
+// File upload endpoint
+app.post('/api/upload', upload.single('file'), (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+    
+    const fileUrl = `${config.clientUrl}/uploads/${req.file.filename}`;
+    res.json({ 
+      success: true, 
+      fileUrl,
+      filename: req.file.filename,
+      originalName: req.file.originalname,
+      size: req.file.size
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'File upload failed' });
+  }
+});
+
+// Serve uploaded files
+app.use('/uploads', express.static('uploads'));
 
 // Root route
 app.get('/', (req, res) => {
-  res.send('Socket.io Chat Server is running');
+  res.json({
+    message: 'Socket.io Chat Server is running',
+    version: '1.0.0',
+    endpoints: {
+      rooms: '/api/rooms',
+      users: '/api/users',
+      upload: '/api/upload'
+    }
+  });
+});
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error(error.stack);
+  res.status(500).json({ error: 'Something went wrong!' });
 });
 
 // Start server
-const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+server.listen(config.port, () => {
+  console.log(`🚀 Server running on port ${config.port}`);
+  console.log(`📡 Socket.io server ready for connections`);
+  console.log(`🌐 Client URL: ${config.clientUrl}`);
 });
 
 module.exports = { app, server, io }; 
